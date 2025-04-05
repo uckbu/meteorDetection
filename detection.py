@@ -18,9 +18,15 @@ VIDEOS_DIR = "videos"
 # Ensure output folder exists
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 
+
 # === LOAD MODEL ===
-session = ort.InferenceSession(MODEL_PATH)
+providers = ['TensorrtExecutionProvider',
+             'CUDAExecutionProvider',
+             'CPUExecutionProvider']
+session = ort.InferenceSession(MODEL_PATH, providers=providers)
 input_name = session.get_inputs()[0].name
+
+
 
 def preprocess(frame):
     """
