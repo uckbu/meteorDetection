@@ -57,17 +57,16 @@ def run_inference(frame):
     return False
 
 def gstreamer_pipeline():
-    """
-    Creates a GStreamer pipeline string for the IMX219 CSI camera on the Jetson Nano.
-    The pipeline uses a native sensor resolution of 1280x720 and then downscales to 640x640.
-    """
-    pipeline = (
+    return (
         "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM),width={0},height={1},framerate={2}/1 ! "
-        "nvvidconv ! video/x-raw,width={3},height={4},format=BGRx ! "
+        "video/x-raw(memory:NVMM),width={in_w},height={in_h},format=NV12,framerate={fps}/1 ! "
+        "nvvidconv ! video/x-raw,width={out_w},height={out_h},format=BGRx ! "
         "videoconvert ! video/x-raw,format=BGR ! appsink"
-    ).format(CAMERA_WIDTH, CAMERA_HEIGHT, FPS, FRAME_WIDTH, FRAME_HEIGHT)
-    return pipeline
+    ).format(
+        in_w=CAMERA_WIDTH, in_h=CAMERA_HEIGHT,
+        fps=FPS,
+        out_w=FRAME_WIDTH, out_h=FRAME_HEIGHT
+    )
 
 # === INITIALIZE CAMERA ===
 cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
