@@ -2,121 +2,142 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from collections import deque
+import time
 import datetime
 import os
 
 # === CONFIGURATION ===
-MODEL_PATH           = "yolov5s.onnx"   # or your meteor model
+MODEL_PATH = "yolov5s.onnx"   # Path to your ONNX model
+# Sensor native resolution (supported by the IMX219)
+CAMERA_WIDTH, CAMERA_HEIGHT = 1280, 720
+# Output resolution (network expects 640x640)
 FRAME_WIDTH, FRAME_HEIGHT = 640, 640
-FPS                  = 30
-DETECTION_THRESHOLD  = 0.5  # confidence threshold
-VIDEOS_DIR           = "videos"
+FPS = 30
+PRE_BUFFER_SIZE = 60   # 60 frames before event (approx. 2 sec)
+POST_BUFFER_SIZE = 60  # 60 frames after event ends
+DETECTION_THRESHOLD = 0.5  # Confidence threshold for meteor detection
+VIDEOS_DIR = "videos"
 
+# Ensure output folder exists
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 
 # === LOAD MODEL ===
-providers = [
-    'TensorrtExecutionProvider',
-    'CUDAExecutionProvider',
-    'CPUExecutionProvider'
-]
-session    = ort.InferenceSession(MODEL_PATH, providers=providers)
+providers = ['TensorrtExecutionProvider',
+             'CUDAExecutionProvider',
+             'CPUExecutionProvider']
+session = ort.InferenceSession(MODEL_PATH, providers=providers)
 input_name = session.get_inputs()[0].name
 
 def preprocess(frame):
-    # resize, BGR→RGB, normalize, CHW, batch
+    """
+    Resize, convert to RGB, normalize, and reformat for ONNX.
+    """
     img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return np.expand_dims(img, axis=0)
+    img = np.transpose(img, (2, 0, 1))  # from HWC to CHW
+    img = np.expand_dims(img, axis=0)     # add batch dimension
+    return img
 
 def run_inference(frame):
     """
-    Returns a list of detections: [(x1,y1,x2,y2,conf), ...]
-    Assumes a YOLOv5 ONNX with raw preds [cx,cy,w,h,obj,cls0,cls1...].
-    Applies simple decoding + NMS.
+    Run the model on a preprocessed frame.
+    Returns True if any detection has confidence above threshold.
+    (This simple check assumes the model output has confidence in column index 4.)
     """
-    inp = preprocess(frame)
-    preds = np.squeeze(session.run(None, {input_name: inp})[0])
-    if preds.ndim == 1:
-        preds = np.expand_dims(preds, axis=0)
-
-    boxes      = []
-    confidences = []
-
-    for p in preds:
-        obj_conf = float(p[4])
-        if obj_conf < DETECTION_THRESHOLD:
-            continue
-
-        # get class confidence (if you only have one class you can skip)
-        class_scores = p[5:]
-        class_id     = int(np.argmax(class_scores))
-        class_conf   = float(class_scores[class_id])
-        conf         = obj_conf * class_conf
-        if conf < DETECTION_THRESHOLD:
-            continue
-
-        # decode from center‐wh to x,y,w,h in pixels
-        cx, cy, w, h = p[0], p[1], p[2], p[3]
-        x = (cx - w/2.0) * FRAME_WIDTH
-        y = (cy - h/2.0) * FRAME_HEIGHT
-        w_pix = w * FRAME_WIDTH
-        h_pix = h * FRAME_HEIGHT
-
-        boxes.append([int(x), int(y), int(w_pix), int(h_pix)])
-        confidences.append(conf)
-
-    # run NMS
-    indices = cv2.dnn.NMSBoxes(boxes, confidences,
-                               DETECTION_THRESHOLD, 0.4)
-    results = []
-    if len(indices) > 0:
-        for i in indices.flatten():
-            x, y, w_pix, h_pix = boxes[i]
-            x1, y1 = x, y
-            x2, y2 = x + w_pix, y + h_pix
-            results.append((x1, y1, x2, y2, confidences[i]))
-    return results
+    input_tensor = preprocess(frame)
+    outputs = session.run(None, {input_name: input_tensor})
+    # Assuming model outputs shape [1, N, 85] and index 4 is objectness/confidence
+    detections = np.squeeze(outputs[0])
+    # If there is only one detection, ensure it is two-dimensional
+    if detections.ndim == 1:
+        detections = np.expand_dims(detections, axis=0)
+    if detections.size and np.any(detections[:, 4] > DETECTION_THRESHOLD):
+        return True
+    return False
 
 def gstreamer_pipeline():
-    return ("nvarguscamerasrc ! video/x-raw(memory:NVMM), width={0}, height={1}, "
-            "format=NV12, framerate={2}/1 ! nvvidconv ! video/x-raw, width={0}, height={1}, "
-            "format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
-           ).format(FRAME_WIDTH, FRAME_HEIGHT, FPS)
+    """
+    Creates a GStreamer pipeline string for the IMX219 CSI camera on the Jetson Nano.
+    The pipeline uses a native sensor resolution of 1280x720 and then downscales to 640x640.
+    """
+    pipeline = (
+        "nvarguscamerasrc sensor-id=0 ! "
+        "video/x-raw(memory:NVMM),width={0},height={1},framerate={2}/1 ! "
+        "nvvidconv ! video/x-raw,width={3},height={4},format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! appsink"
+    ).format(CAMERA_WIDTH, CAMERA_HEIGHT, FPS, FRAME_WIDTH, FRAME_HEIGHT)
+    return pipeline
 
-# === INITIALIZE CAMERA & WINDOW ===
+# === INITIALIZE CAMERA ===
 cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
 if not cap.isOpened():
-    print("Error: Unable to open camera.")
+    print("Error: Unable to open camera with pipeline:")
+    print(gstreamer_pipeline())
     exit()
 
-cv2.namedWindow("Meteor Detection", cv2.WINDOW_AUTOSIZE)
+# Buffers and state variables
+pre_buffer = deque(maxlen=PRE_BUFFER_SIZE)
+recording_frames = []  # will hold frames for the current meteor event
+recording = False
+post_counter = 0
 
-print("[INFO] Starting live detection. Press 'q' to quit.")
+print("[INFO] Starting video capture and meteor detection...")
 
 try:
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("Failed to capture frame.")
             break
 
-        # run model
-        dets = run_inference(frame)
+        # Always add the current frame to the pre-buffer
+        pre_buffer.append(frame.copy())
 
-        # draw boxes
-        for (x1, y1, x2, y2, conf) in dets:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = "Meteor: {0:.2f}".format(conf)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # Run inference on the current frame
+        meteor_detected = run_inference(frame)
 
-        # show
-        cv2.imshow("Meteor Detection", frame)
+        if meteor_detected:
+            # Start a new event if not already recording
+            if not recording:
+                print("[EVENT] Meteor detected! Starting event recording.")
+                # Prepend the pre-buffer (frames before the meteor appeared)
+                recording_frames = list(pre_buffer)
+                recording = True
+            # Append the current frame and reset post-event counter
+            recording_frames.append(frame.copy())
+            post_counter = 0
+        else:
+            if recording:
+                # Meteor no longer detected; keep recording post-event frames
+                recording_frames.append(frame.copy())
+                post_counter += 1
+                # Once we have recorded enough post-event frames, finalize the video
+                if post_counter >= POST_BUFFER_SIZE:
+                    finish_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    video_filename = os.path.join(VIDEOS_DIR, "{}.mp4".format(finish_time))
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    out = cv2.VideoWriter(video_filename, fourcc, FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+                    
+                    for frm in recording_frames:
+                        out.write(frm)
+                    out.release()
+
+                    print("[INFO] Saved event video: {}".format(video_filename))
+                    
+                    # Reset recording state
+                    recording = False
+                    recording_frames = []
+                    post_counter = 0
+
+        # Display the frame with optional meteor detection overlays
+        cv2.imshow("CSI Camera", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+except KeyboardInterrupt:
+    print("Interrupted by user.")
+
+# Clean up
+cap.release()
+cv2.destroyAllWindows()
