@@ -7,7 +7,7 @@ import datetime
 import os
 
 # === CONFIGURATION ===
-MODEL_PATH = "meteor_yolov5s.onnx"   # Path to your ONNX model
+MODEL_PATH = "yolov5s.onnx"   # Path to your ONNX model
 FRAME_WIDTH, FRAME_HEIGHT = 640, 640
 FPS = 30
 PRE_BUFFER_SIZE = 60   # 60 frames before event (approx. 2 sec)
