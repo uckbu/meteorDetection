@@ -54,11 +54,11 @@ def gstreamer_pipeline():
     """
     Creates a GStreamer pipeline string for the CSI camera on the Jetson Nano.
     """
-    return (
-        f"nvarguscamerasrc ! video/x-raw(memory:NVMM), width={FRAME_WIDTH}, height={FRAME_HEIGHT}, "
-        f"format=NV12, framerate={FPS}/1 ! nvvidconv ! video/x-raw, width={FRAME_WIDTH}, height={FRAME_HEIGHT}, "
-        "format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
-    )
+    pipeline = ("nvarguscamerasrc ! video/x-raw(memory:NVMM), width={}, height={}, "
+                "format=NV12, framerate={}/1 ! nvvidconv ! video/x-raw, width={}, height={}, "
+                "format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink").format(
+                    FRAME_WIDTH, FRAME_HEIGHT, FPS, FRAME_WIDTH, FRAME_HEIGHT)
+    return pipeline
 
 # === INITIALIZE CAMERA ===
 cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
@@ -105,7 +105,7 @@ try:
                 # Once we have recorded enough post-event frames, finalize the video
                 if post_counter >= POST_BUFFER_SIZE:
                     finish_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                    video_filename = os.path.join(VIDEOS_DIR, f"{finish_time}.mp4")
+                    video_filename = os.path.join(VIDEOS_DIR, "{}.mp4".format(finish_time))
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     out = cv2.VideoWriter(video_filename, fourcc, FPS, (FRAME_WIDTH, FRAME_HEIGHT))
                     
@@ -113,7 +113,7 @@ try:
                         out.write(frm)
                     out.release()
 
-                    print(f"[INFO] Saved event video: {video_filename}")
+                    print("[INFO] Saved event video: {}".format(video_filename))
                     
                     # Reset recording state
                     recording = False
